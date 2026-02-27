@@ -54,6 +54,16 @@ const graphTypeOrder: EntityType[] = [
   "time_window",
 ];
 
+const graphDisplayOrder: EntityType[] = [
+  "risk",
+  "change",
+  "division",
+  "application",
+  "service",
+  "server",
+  "ip",
+];
+
 function loadAuth(): AuthState | null {
   const raw = localStorage.getItem(AUTH_STORAGE_KEY);
   if (!raw) return null;
@@ -208,6 +218,24 @@ function formatDate(value?: string) {
   return trimmed;
 }
 
+function parseDateValue(value?: string) {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.replace(" ", "T");
+  const parsed = Date.parse(normalized);
+  if (!Number.isNaN(parsed)) return parsed;
+  const fallback = Date.parse(trimmed);
+  return Number.isNaN(fallback) ? null : fallback;
+}
+
+function formatTimestamp(value: number | null) {
+  if (value === null) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "—";
+  return date.toISOString().slice(0, 16).replace("T", " ");
+}
+
 function truncateText(value: string, max = 180) {
   const cleaned = value.replace(/\s+/g, " ").trim();
   if (!cleaned) return "No description available.";
@@ -250,6 +278,12 @@ export default function App() {
   const [riskFilter, setRiskFilter] = useState<string[]>([]);
   const [serverFilter, setServerFilter] = useState("");
   const [timeFilter, setTimeFilter] = useState("");
+  const [graphApplicationFilter, setGraphApplicationFilter] = useState("");
+  const [graphServiceFilter, setGraphServiceFilter] = useState("");
+  const [graphRange, setGraphRange] = useState<{ start: number | null; end: number | null }>({
+    start: null,
+    end: null,
+  });
   const [aiMin, setAiMin] = useState("");
   const [aiMax, setAiMax] = useState("");
   const [selected, setSelected] = useState<BaseEntity | null>(null);
@@ -262,7 +296,7 @@ export default function App() {
   const [graphTypeFilters, setGraphTypeFilters] = useState<Record<EntityType, boolean>>(
     () =>
       graphTypeOrder.reduce(
-        (acc, type) => ({ ...acc, [type]: true }),
+        (acc, type) => ({ ...acc, [type]: type !== "time_window" }),
         {} as Record<EntityType, boolean>
       )
   );
@@ -384,6 +418,14 @@ export default function App() {
     () => nodes.filter((node) => node.type === "server"),
     [nodes]
   );
+  const applications = useMemo(
+    () => nodes.filter((node) => node.type === "application"),
+    [nodes]
+  );
+  const services = useMemo(
+    () => nodes.filter((node) => node.type === "service"),
+    [nodes]
+  );
 
   function relatedEntities(id: string, type: ConnectionType) {
     const outgoing = linksByFrom.get(id) ?? [];
@@ -486,6 +528,79 @@ export default function App() {
     links,
   ]);
 
+  const graphTimeBounds = useMemo(() => {
+    const times = changes
+      .map((change) => parseDateValue(change.startDate))
+      .filter((value): value is number => value !== null);
+    if (!times.length) return null;
+    return {
+      min: Math.min(...times),
+      max: Math.max(...times),
+    };
+  }, [changes]);
+
+  const graphTimeStep = useMemo(() => {
+    if (!graphTimeBounds) return 60 * 60 * 1000;
+    const span = graphTimeBounds.max - graphTimeBounds.min;
+    if (span > 1000 * 60 * 60 * 24 * 45) return 1000 * 60 * 60 * 24 * 7;
+    if (span > 1000 * 60 * 60 * 24 * 10) return 1000 * 60 * 60 * 24;
+    return 1000 * 60 * 60;
+  }, [graphTimeBounds]);
+
+  useEffect(() => {
+    if (!graphTimeBounds) return;
+    setGraphRange((prev) => {
+      if (prev.start !== null && prev.end !== null) return prev;
+      return { start: graphTimeBounds.min, end: graphTimeBounds.max };
+    });
+  }, [graphTimeBounds]);
+
+  const graphFilteredChanges = useMemo(() => {
+    const rangeStart =
+      graphRange.start !== null && graphRange.end !== null
+        ? Math.min(graphRange.start, graphRange.end)
+        : null;
+    const rangeEnd =
+      graphRange.start !== null && graphRange.end !== null
+        ? Math.max(graphRange.start, graphRange.end)
+        : null;
+    return filteredChanges.filter((change) => {
+      const startValue = parseDateValue(change.startDate);
+      const appNames = relatedEntities(change.id, "affects").map((item) =>
+        item.name.toLowerCase()
+      );
+      const serviceNames = relatedEntities(change.id, "impacts").map((item) =>
+        item.name.toLowerCase()
+      );
+      const matchesApp = graphApplicationFilter
+        ? appNames.includes(graphApplicationFilter.toLowerCase())
+        : true;
+      const matchesService = graphServiceFilter
+        ? serviceNames.includes(graphServiceFilter.toLowerCase())
+        : true;
+
+      const matchesTime =
+        rangeStart !== null && rangeEnd !== null && startValue !== null
+          ? startValue >= rangeStart && startValue <= rangeEnd
+          : true;
+
+      return matchesTime && matchesApp && matchesService;
+    });
+  }, [
+    filteredChanges,
+    graphRange,
+    graphTimeBounds,
+    graphApplicationFilter,
+    graphServiceFilter,
+    links,
+    nodes,
+  ]);
+
+  const graphStartValue = graphRange.start ?? graphTimeBounds?.min ?? 0;
+  const graphEndValue = graphRange.end ?? graphTimeBounds?.max ?? 0;
+  const graphRangeReady =
+    graphTimeBounds && graphRange.start !== null && graphRange.end !== null;
+
   function toggleFlip(id: string) {
     setFlipped((prev) => ({ ...prev, [id]: !prev[id] }));
   }
@@ -522,7 +637,7 @@ export default function App() {
 
   const graphData = useMemo(() => {
     const allowedTypes = graphTypeFilters;
-    const changeIds = new Set(filteredChanges.map((change) => change.id));
+    const changeIds = new Set(graphFilteredChanges.map((change) => change.id));
     const connectedIds = new Set(changeIds);
 
     links.forEach((link) => {
@@ -556,7 +671,7 @@ export default function App() {
         target: link.toId,
       })),
     };
-  }, [nodes, links, graphTypeFilters, filteredChanges]);
+  }, [nodes, links, graphTypeFilters, graphFilteredChanges]);
 
   function relatedByType(entity: BaseEntity) {
     const linksFor = links.filter(
@@ -579,7 +694,7 @@ export default function App() {
       <header className="hero">
         <div>
           <p className="eyebrow">change relationship cards</p>
-          <h1>relationship intelligence, mapped.</h1>
+          <h1>Change relationship intelligence, mapped.</h1>
           <p className="subtitle">
             Explore change requests as collectible cards and a force graph that reveals
             how divisions, services, servers, apps, and risk intersect across time windows.
@@ -955,108 +1070,210 @@ export default function App() {
           {view === "graph" && (
             <section className="graph-view">
               <div className="graph-filters">
-                <div className="filters">
-                  <input
-                    value={search}
-                    onChange={(event) => setSearch(event.target.value)}
-                    placeholder="Search change number, text, division"
-                  />
-                  <select
-                    value={divisionFilter}
-                    onChange={(event) => setDivisionFilter(event.target.value)}
-                  >
-                    <option value="">All divisions</option>
-                    {divisions
-                      .slice()
-                      .sort((a, b) => a.name.localeCompare(b.name))
-                      .map((division) => (
-                        <option key={division.id} value={division.name}>
-                          {division.name}
-                        </option>
-                      ))}
-                  </select>
-                  <div className="filter-group">
-                    <span>Risks</span>
-                    {risks
-                      .slice()
-                      .sort((a, b) => a.name.localeCompare(b.name))
-                      .map((risk) => (
-                        <label key={risk.id} className="checkbox">
-                          <input
-                            type="checkbox"
-                            checked={riskFilter.includes(risk.name)}
-                            onChange={() =>
-                              setRiskFilter((prev) =>
-                                prev.includes(risk.name)
-                                  ? prev.filter((value) => value !== risk.name)
-                                  : [...prev, risk.name]
-                              )
-                            }
-                          />
-                          {risk.name}
-                        </label>
-                      ))}
+                <div className="graph-filter-panel">
+                  <div className="filter-row filter-row-title">
+                    <span className="filter-title">Filters</span>
                   </div>
-                  <select
-                    value={timeFilter}
-                    onChange={(event) => setTimeFilter(event.target.value)}
-                  >
-                    <option value="">All time windows</option>
-                    {timeWindows
-                      .slice()
-                      .sort((a, b) => a.name.localeCompare(b.name))
-                      .map((time) => (
-                        <option key={time.id} value={time.name}>
-                          {time.name}
-                        </option>
-                      ))}
-                  </select>
-                  <select
-                    value={serverFilter}
-                    onChange={(event) => setServerFilter(event.target.value)}
-                  >
-                    <option value="">All servers</option>
-                    {servers
-                      .slice()
-                      .sort((a, b) => a.name.localeCompare(b.name))
-                      .map((server) => (
-                        <option key={server.id} value={server.name}>
-                          {server.name}
-                        </option>
-                      ))}
-                  </select>
-                  <div className="range-inputs">
-                    <input
-                      type="number"
-                      value={aiMin}
-                      onChange={(event) => setAiMin(event.target.value)}
-                      placeholder="AI min"
-                    />
-                    <input
-                      type="number"
-                      value={aiMax}
-                      onChange={(event) => setAiMax(event.target.value)}
-                      placeholder="AI max"
-                    />
-                  </div>
-                </div>
-                <div className="filter-group">
-                  <span>Show</span>
-                  {graphTypeOrder.map((type) => (
-                    <label key={type} className="checkbox">
+                  <div className="filter-row">
+                    <div className="filters">
                       <input
-                        type="checkbox"
-                        checked={graphTypeFilters[type]}
-                        onChange={() =>
-                          setGraphTypeFilters((prev) => ({
-                            ...prev,
-                            [type]: !prev[type],
-                          }))
-                        }
+                        value={search}
+                        onChange={(event) => setSearch(event.target.value)}
+                        placeholder="Search change number, text, division"
                       />
-                      {typeLabels[type] ?? type}
-                    </label>
-                  ))}
+                      <select
+                        value={divisionFilter}
+                        onChange={(event) => setDivisionFilter(event.target.value)}
+                      >
+                        <option value="">All divisions</option>
+                        {divisions
+                          .slice()
+                          .sort((a, b) => a.name.localeCompare(b.name))
+                          .map((division) => (
+                            <option key={division.id} value={division.name}>
+                              {division.name}
+                            </option>
+                          ))}
+                      </select>
+                      <select
+                        value={graphApplicationFilter}
+                        onChange={(event) =>
+                          setGraphApplicationFilter(event.target.value)
+                        }
+                      >
+                        <option value="">All applications</option>
+                        {applications
+                          .slice()
+                          .sort((a, b) => a.name.localeCompare(b.name))
+                          .map((application) => (
+                            <option key={application.id} value={application.name}>
+                              {application.name}
+                            </option>
+                          ))}
+                      </select>
+                      <select
+                        value={graphServiceFilter}
+                        onChange={(event) => setGraphServiceFilter(event.target.value)}
+                      >
+                        <option value="">All services</option>
+                        {services
+                          .slice()
+                          .sort((a, b) => a.name.localeCompare(b.name))
+                          .map((service) => (
+                            <option key={service.id} value={service.name}>
+                              {service.name}
+                            </option>
+                          ))}
+                      </select>
+                      <select
+                        value={serverFilter}
+                        onChange={(event) => setServerFilter(event.target.value)}
+                      >
+                        <option value="">All servers</option>
+                        {servers
+                          .slice()
+                          .sort((a, b) => a.name.localeCompare(b.name))
+                          .map((server) => (
+                            <option key={server.id} value={server.name}>
+                              {server.name}
+                            </option>
+                          ))}
+                      </select>
+                      <div className="range-inputs">
+                        <input
+                          type="number"
+                          value={aiMin}
+                          onChange={(event) => setAiMin(event.target.value)}
+                          placeholder="AI min"
+                        />
+                        <input
+                          type="number"
+                          value={aiMax}
+                          onChange={(event) => setAiMax(event.target.value)}
+                          placeholder="AI max"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <div className="filter-row">
+                    <div className="filter-group filter-group-risks">
+                      <span>Risks</span>
+                      {risks
+                        .slice()
+                        .sort((a, b) => a.name.localeCompare(b.name))
+                        .map((risk) => (
+                          <label key={risk.id} className="checkbox">
+                            <input
+                              type="checkbox"
+                              checked={riskFilter.includes(risk.name)}
+                              onChange={() =>
+                                setRiskFilter((prev) =>
+                                  prev.includes(risk.name)
+                                    ? prev.filter((value) => value !== risk.name)
+                                    : [...prev, risk.name]
+                                )
+                              }
+                            />
+                            {risk.name}
+                          </label>
+                        ))}
+                    </div>
+                  </div>
+                  <div className="filter-row">
+                    <div className="time-range">
+                      <div className="time-range-header">
+                        <span>Change window</span>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => {
+                            if (!graphTimeBounds) return;
+                            setGraphRange({
+                              start: graphTimeBounds.min,
+                              end: graphTimeBounds.max,
+                            });
+                          }}
+                        >
+                          Reset
+                        </button>
+                      </div>
+                      <div className="time-range-values">
+                        <div>
+                          <span>From</span>
+                          <strong>{formatTimestamp(graphStartValue)}</strong>
+                        </div>
+                        <div>
+                          <span>To</span>
+                          <strong>{formatTimestamp(graphEndValue)}</strong>
+                        </div>
+                        <div className="time-range-count">
+                          {graphFilteredChanges.length} changes
+                        </div>
+                      </div>
+                      <div className="time-range-sliders">
+                        <input
+                          type="range"
+                          min={graphTimeBounds?.min ?? 0}
+                          max={graphTimeBounds?.max ?? 0}
+                          step={graphTimeStep}
+                          value={graphStartValue}
+                          disabled={!graphRangeReady}
+                          onChange={(event) => {
+                            const value = Number(event.target.value);
+                            setGraphRange((prev) => {
+                              const end = prev.end ?? value;
+                              return {
+                                start: Math.min(value, end),
+                                end: Math.max(value, end),
+                              };
+                            });
+                          }}
+                        />
+                        <input
+                          type="range"
+                          min={graphTimeBounds?.min ?? 0}
+                          max={graphTimeBounds?.max ?? 0}
+                          step={graphTimeStep}
+                          value={graphEndValue}
+                          disabled={!graphRangeReady}
+                          onChange={(event) => {
+                            const value = Number(event.target.value);
+                            setGraphRange((prev) => {
+                              const start = prev.start ?? value;
+                              return {
+                                start: Math.min(start, value),
+                                end: Math.max(start, value),
+                              };
+                            });
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <div className="filter-row filter-row-title">
+                    <span className="filter-title">Show</span>
+                  </div>
+                  <div className="filter-row">
+                    <div className="filter-group filter-group-types">
+                      {graphDisplayOrder
+                        .filter((type) => type !== "capability" && type !== "time_window")
+                        .map((type) => (
+                          <label key={type} className="checkbox">
+                            <input
+                              type="checkbox"
+                              checked={graphTypeFilters[type]}
+                              onChange={() =>
+                                setGraphTypeFilters((prev) => ({
+                                  ...prev,
+                                  [type]: !prev[type],
+                                }))
+                              }
+                            />
+                            {typeLabels[type] ?? type}
+                          </label>
+                        ))}
+                    </div>
+                  </div>
                 </div>
               </div>
               <div className="graph-layout">
@@ -1082,11 +1299,15 @@ export default function App() {
                       const size =
                         node.type === "risk"
                           ? 26
-                          : node.type === "change"
+                          : node.type === "application"
                             ? 20
-                            : node.type === "division"
-                              ? 13
-                              : 10;
+                            : node.type === "service"
+                              ? 18
+                              : node.type === "change"
+                                ? 12
+                                : node.type === "division"
+                                  ? 13
+                                  : 10;
                       const fontSize = 13 / globalScale;
                       ctx.fillStyle = node.color;
                       ctx.beginPath();
@@ -1117,7 +1338,7 @@ export default function App() {
                   <div className="legend">
                     <strong>Legend</strong>
                     <ul>
-                      {graphTypeOrder.map((type) => (
+                      {graphDisplayOrder.map((type) => (
                         <li key={type}>
                           <span style={{ background: typeColors[type] }} />
                           {typeLabels[type]}
